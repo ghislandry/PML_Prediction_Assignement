@@ -1,0 +1,171 @@
+---
+title: "Prediction Assignment Writeup"
+output: html_document
+---
+## Model building
+
+A quick look at the data set provided shows that it contains observations about 159 variables describing how participants performed the exercice, in addition, the variables "classe" tells how well the they did the exercice. So, in total there are 160 variables. Also, re
+
+So, we convert the observations as NAs when loading them to the workspace.
+The following R code will download the data form the course web site and store it to the directory named data if it exits, otherwise, a directory named data will be created and the data stored to it. The seed it set to make all this reproducible; however, the value selected for the seed does not have a special meaning.
+
+Also, we will install the doMC package to speed up the calculation. 
+
+```{r}
+set.seed(3433)
+
+## Install the doMC package if it is not registered
+if(! "doMC" %in% rownames(installed.packages())){
+    install.packages("doMC", dependencies=T)     
+}
+
+# Load Libraries
+library(ggplot2)
+library(caret)
+library(doMC)
+
+## Register 4 cores
+
+registerDoMC(cores = 4)
+
+if(!file.exists("data")){
+        dir.create("data")
+}
+if(!file.exists("./data/pml-training.csv")){
+        fileUrl <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+        download.file(fileUrl, destfile="./data/pml-training.csv", meth="curl")
+        dateDownloadtrain <- data()
+}
+
+#set the global path 
+training.path <- file.path("./data", "pml-training.csv")
+
+## loading the training data set while converting empty entries into NAs
+trainSet <- read.csv(training.path, na.strings=c("NA",""))
+```
+
+After replacing missing observations by NAs, we notice that most of the predictors in our data set have a single unique value, which is NA. 
+Because this may cause our model to crash or the fit to be unstable, we will remove such predictors. We also remove predictors which are not related to participants activities. 
+
+```{r, echo=FALSE}
+good <- apply(trainSet, 2, function(x){sum(is.na(x))})
+validData <- trainSet[ ,which(good == 0)]
+
+###### Removing useless Predictors #######
+
+uselessColumns <- grep("timestamp|X|user_name|new_window",names(validData))
+validData <- validData[, -uselessColumns]
+```
+
+Let us split our data set into training and test data sets; the training is about 3/4 th of the overall data set; whereas the remaining 1/4 th is used as test set.  
+
+```{r}
+## Split the data into training and testing data sets: 3/4 for training and 1/4 for testing
+
+inTrain <- createDataPartition( y = validData$classe, p = 3/4, list = FALSE)
+training <- validData[inTrain, ]
+testing <- validData[-inTrain, ]
+```
+
+While there are some models that thrive on correlated predictors (such as pls), other models may benefit from reducing the level of correlation between the predictors.
+The folowing remove highly correlated. In this case, we consider as highly corelated variables whose corelation is above 80\%.
+
+```{r}
+M <- abs(cor(training[, -grep("classe", names(training))]))
+diag(M) <- 0
+M[upper.tri(M)] <- 0 # set the upper matrix to 0
+correlvar <- which(M > 0.80, arr.ind=T)
+correlatedCols <- grep(paste(rownames(correlvar), collapse="|"), names(training))
+training <- training[, -correlatedCols]
+```
+
+As my computer is relativelly slow, it will be helpful to reduce the number of features, using Principal Component Analysis (PCA). We will keep 95\% of the variability. The train control need the allowParallel which instructs R to perform a parallel fit
+
+```{r}
+preProc <- preProcess(training[, -grep("classe", names(training))], method = "pca", thresh=0.95)
+
+trainPC <- predict(preProc, training[ , -grep("classe", names(training))])
+
+## The train control need the allowParallel which instructs R to perform a parallel fit
+
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 10)
+
+```
+
+Random forest is known as one of the most efficient machine learning algorithm despite the fact it sometimes can be time consuming. For our purpose, we will fit a random forest model via the rf package.
+
+Since compiling the R markdown file will always train the model, let us cache the value of train model modFit, so that it does not have to compute it when it is available from the cache.
+
+
+```{r}
+makeCacheFit <- function(x = data.frame()) {
+        
+        modFit <- NULL
+        set <- function(y) {
+                x <<- y
+                modFit <<- NULL
+        }
+        get <- function() x
+        setmodelfit <- function(train) modFit <<- train
+        getmodelfit <- function() modFit
+        
+        list(set = set, get = get, setmodelfit = setmodelfit, getmodelfit = getmodelfit)
+}
+
+cacheSolve <- function(x, ...) {
+        
+        modFit <- x$getmodelfit()
+        if(!is.null(modFit)){
+                message("getting cached data")
+                return(modFit)
+        }
+        
+        data <- x$get()
+        modFit <- train(training$classe ~., method="rf", trControl=fitControl, data=trainPC, ...)
+        x$setmodelfit(modFit)
+        modFit
+}
+
+x <- makeCacheFit(trainPC)
+
+modelFit <- cacheSolve(x)
+
+modelFit
+```
+
+In Sample error:
+
+```{r}
+predictions_train <- predict(modelFit, trainPC)
+
+#paste(c( round((1 - modelFit$results[, c("Accuracy")][1])*100, 2), "%"), collapse="")
+in_error <- (1 - ( sum( predictions_train == training$classe) / length(training$classe) ))*100
+paste(c( round(in_error, 2), "%"), collapse="")
+```
+
+## Cross Validation 
+
+Test the accuracy of our prediction model on the dataset that was left for testing purpose. However, before proceeding forward, we need to perform the same transformations that we performed on the training set to the test set. This is achieve by the following code.
+
+```{r}
+testing <- validData[-inTrain, ]
+testing <- testing[, -correlatedCols]
+
+testPC <- predict(preProc, testing[ , -grep("classe", names(testing))])
+
+predictions <- predict(modelFit, testPC)
+
+confmat <- confusionMatrix(testing$classe, predictions)
+confmat
+```
+
+Out of Sample error, i.e., the error on the cross validation set
+
+```{r}
+out_error <- (1 - ( sum( predictions == testing$classe) / length(testing$classe) ))*100
+
+# 1 - accuracy on the cross validation set 
+#paste(c( round((1 - confmat$overall[1])*100, 2), "%"), collapse="")
+
+paste(c( round(out_error, 2), "%"), collapse="")
+```
